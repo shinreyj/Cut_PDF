@@ -3,78 +3,151 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 from PyPDF2 import PdfReader, PdfWriter
 import pdfplumber
+import logging
+import re
+import difflib
+import threading
 
+# Configurazione logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+# Utility: rende sicuro un nome per il filesystem
+def sanitize_filename(name, max_length=200):
+	# semplice pulizia: rimuove caratteri non validi e tronca
+	name = re.sub(r'[\\/*?:"<>|]', "_", name)
+	name = name.strip()
+	if not name:
+		name = "Nome_Sconosciuto"
+	return name[:max_length]
+
+# Utility: normalizza testo (lowercase, collapse whitespace)
+def normalize_text(s):
+	if not s:
+		return ""
+	return re.sub(r'\s+', ' ', s).strip().lower()
+
+# Carica la lista dei nomi e costruisce una lookup normalizzata -> originale
 def load_employee_names(filename):
-    """Carica la lista dei nomi dipendenti da un file txt."""
-    try:
-        with open(filename, 'r', encoding='utf-8') as file:
-            # Rimuove spazi extra e righe vuote
-            names = [line.strip() for line in file if line.strip()]
-        return names
-    except Exception as e:
-        messagebox.showerror("Errore", f"Errore durante la lettura del file dei nomi: {e}")
-        return []
+	"""Carica la lista dei nomi dipendenti da un file txt."""
+	# ...existing code...
+	try:
+		with open(filename, 'r', encoding='utf-8') as file:
+			names = [line.strip() for line in file if line.strip()]
+		# costruisci mapping normalizzato -> originale (mantiene il primo occorso)
+		lookup = {}
+		for n in names:
+			norm = normalize_text(n)
+			if norm and norm not in lookup:
+				lookup[norm] = n
+		return lookup
+	except Exception as e:
+		# usa logging per debug e messagebox per l'utente
+		logging.exception("Errore durante la lettura del file dei nomi")
+		messagebox.showerror("Errore", f"Errore durante la lettura del file dei nomi: {e}")
+		return {}
 
-def extract_names_from_pdf(pdf_path, employee_names):
-    """Estrae i nomi cercando corrispondenze con la lista dei dipendenti."""
-    names = []
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for i, page in enumerate(pdf.pages):
-                text = page.extract_text()
-                if not text:
-                    names.append(f"Nome_Sconosciuto_{i+1}")
-                    continue
+def extract_names_from_pdf(pdf_path, employee_lookup, use_fuzzy=True, fuzzy_cutoff=0.85):
+	"""Estrae i nomi cercando corrispondenze con la lista dei dipendenti.
+	employee_lookup: dict normalizzato -> originale
+	"""
+	names = []
+	try:
+		with pdfplumber.open(pdf_path) as pdf:
+			for i, page in enumerate(pdf.pages):
+				text = page.extract_text()
+				ntext = normalize_text(text)
+				if not ntext:
+					names.append(f"Nome_Sconosciuto_{i+1}")
+					continue
 
-                found_name = False
-                # Cerca ogni nome della lista nel testo della pagina
-                for employee_name in employee_names:
-                    if employee_name in text:
-                        names.append(employee_name)
-                        found_name = True
-                        print(f"Nome trovato: {employee_name}")
-                        break
-                
-                if not found_name:
-                    print(f"Nessun nome trovato nella pagina {i+1}")
-                    names.append(f"Nome_Sconosciuto_{i+1}")
-                    
-    except Exception as e:
-        print(f"Errore durante l'estrazione: {e}")
-        messagebox.showerror("Errore", f"Errore durante l'estrazione dei nomi: {e}")
-    return names
+				found_name = False
+				# Primo: ricerca esatta per substring su normalizzato
+				for norm_name, original_name in employee_lookup.items():
+					if norm_name and norm_name in ntext:
+						names.append(original_name)
+						found_name = True
+						logging.info(f"Nome trovato (esatto): {original_name} pagina {i+1}")
+						break
+
+				# Secondo: fuzzy match sui token (opzionale)
+				if not found_name and use_fuzzy and employee_lookup:
+					# Lista di chiavi normalizzate
+					candidates = difflib.get_close_matches(ntext, list(employee_lookup.keys()), n=1, cutoff=fuzzy_cutoff)
+					if not candidates:
+						# alternativa: prova matching su singole parole della pagina con le chiavi
+						words = set(ntext.split())
+						best = None
+						best_ratio = 0.0
+						for key in employee_lookup.keys():
+							for w in words:
+								r = difflib.SequenceMatcher(None, w, key).ratio()
+								if r > best_ratio:
+									best_ratio = r
+									best = key
+						if best and best_ratio >= fuzzy_cutoff:
+							candidates = [best]
+					if candidates:
+						orig = employee_lookup[candidates[0]]
+						names.append(orig + " (fuzzy)")
+						found_name = True
+						logging.info(f"Nome trovato (fuzzy): {orig} pagina {i+1}")
+
+				if not found_name:
+					logging.info(f"Nessun nome trovato nella pagina {i+1}")
+					names.append(f"Nome_Sconosciuto_{i+1}")
+
+	except Exception as e:
+		logging.exception("Errore durante l'estrazione")
+		messagebox.showerror("Errore", f"Errore durante l'estrazione dei nomi: {e}")
+	return names
 
 def split_and_rename_pdf(input_file, output_folder):
-    """Divide il PDF in singole pagine e rinomina ogni pagina in base ai nomi estratti."""
-    try:
-        # Carica i nomi dal file txt
-        employee_names = load_employee_names("dipendenti.txt")
-        if not employee_names:
-            messagebox.showerror("Errore", "Nessun nome dipendente trovato nel file.")
-            return
+	"""Divide il PDF in singole pagine e rinomina ogni pagina in base ai nomi estratti."""
+	try:
+		# Carica i nomi dal file txt (ora torna lookup normalizzata)
+		employee_lookup = load_employee_names("dipendenti.txt")
+		if not employee_lookup:
+			messagebox.showerror("Errore", "Nessun nome dipendente trovato nel file.")
+			return
 
-        # Estrai i nomi dal PDF utilizzando la lista dei dipendenti
-        names_list = extract_names_from_pdf(input_file, employee_names)
-        reader = PdfReader(input_file)
+		# Estrai i nomi dal PDF utilizzando la lista dei dipendenti
+		names_list = extract_names_from_pdf(input_file, employee_lookup)
+		try:
+			reader = PdfReader(input_file)
+		except Exception as e:
+			logging.exception("Errore apertura PDF")
+			messagebox.showerror("Errore", f"Impossibile aprire il PDF: {e}")
+			return
 
-        for i, name in enumerate(names_list):
-            writer = PdfWriter()
-            writer.add_page(reader.pages[i])
+		num_pages = len(reader.pages)
+		# sicurezza: tronca o estendi names_list per corrispondere al numero di pagine
+		if len(names_list) > num_pages:
+			names_list = names_list[:num_pages]
+		elif len(names_list) < num_pages:
+			for i in range(len(names_list), num_pages):
+				names_list.append(f"Nome_Sconosciuto_{i+1}")
 
-            base_name = name
-            counter = 1
-            output_path = os.path.join(output_folder, f"{base_name}.pdf")
+		created = 0
+		for i, name in enumerate(names_list):
+			writer = PdfWriter()
+			writer.add_page(reader.pages[i])
 
-            while os.path.exists(output_path):
-                output_path = os.path.join(output_folder, f"{base_name}_{counter}.pdf")
-                counter += 1
+			base_name = sanitize_filename(name)
+			counter = 1
+			output_path = os.path.join(output_folder, f"{base_name}.pdf")
 
-            with open(output_path, "wb") as output_file:
-                writer.write(output_file)
+			while os.path.exists(output_path):
+				output_path = os.path.join(output_folder, f"{base_name}_{counter}.pdf")
+				counter += 1
 
-        messagebox.showinfo("Completato", f"Sono stati creati {len(names_list)} file PDF.")
-    except Exception as e:
-        messagebox.showerror("Errore", f"Errore durante la divisione del PDF: {e}")
+			with open(output_path, "wb") as output_file:
+				writer.write(output_file)
+			created += 1
+
+		messagebox.showinfo("Completato", f"Sono stati creati {created} file PDF.")
+	except Exception as e:
+		logging.exception("Errore durante la divisione del PDF")
+		messagebox.showerror("Errore", f"Errore durante la divisione del PDF: {e}")
 
 # Funzioni dell'interfaccia grafica rimangono invariate.
 
@@ -89,18 +162,30 @@ def select_folder():
     entry_folder.insert(0, folder_path)
 
 def start_process():
-    input_file = entry_file.get()
-    output_folder = entry_folder.get()
+	input_file = entry_file.get()
+	output_folder = entry_folder.get()
 
-    if not os.path.isfile(input_file):
-        messagebox.showerror("Errore", "Il file PDF specificato non esiste.")
-        return
+	if not os.path.isfile(input_file):
+		messagebox.showerror("Errore", "Il file PDF specificato non esiste.")
+		return
 
-    if not os.path.isdir(output_folder):
-        messagebox.showerror("Errore", "La cartella di output specificata non esiste.")
-        return
+	if not os.path.isdir(output_folder):
+		messagebox.showerror("Errore", "La cartella di output specificata non esiste.")
+		return
 
-    split_and_rename_pdf(input_file, output_folder)
+	# disabilita pulsanti e avvia in thread per non bloccare la GUI
+	def worker():
+		try:
+			status_var.set("Elaborazione in corso...")
+			button_start.config(state=tk.DISABLED)
+			button_edit.config(state=tk.DISABLED)
+			split_and_rename_pdf(input_file, output_folder)
+		finally:
+			status_var.set("Pronto")
+			button_start.config(state=tk.NORMAL)
+			button_edit.config(state=tk.NORMAL)
+
+	threading.Thread(target=worker, daemon=True).start()
 
 def edit_employee_list():
     """Apre una finestra per modificare la lista dei dipendenti."""
@@ -167,8 +252,16 @@ entry_folder = tk.Entry(root, width=50)
 entry_folder.grid(row=1, column=1, pady=5, padx=5)
 tk.Button(root, text="Sfoglia", command=select_folder).grid(row=1, column=2, pady=5, padx=5)
 
-tk.Button(root, text="Avvia", command=start_process, width=20).grid(row=2, column=1, pady=10)
+# Mantieni riferimento ai pulsanti per abil/disable
+button_start = tk.Button(root, text="Avvia", command=start_process, width=20)
+button_start.grid(row=2, column=1, pady=10)
 
-tk.Button(root, text="Modifica Lista Dipendenti", command=edit_employee_list).grid(row=3, column=1, pady=10)
+button_edit = tk.Button(root, text="Modifica Lista Dipendenti", command=edit_employee_list)
+button_edit.grid(row=3, column=1, pady=10)
+
+# Etichetta di stato
+status_var = tk.StringVar(value="Pronto")
+status_label = tk.Label(root, textvariable=status_var)
+status_label.grid(row=4, column=1, pady=5)
 
 root.mainloop()
